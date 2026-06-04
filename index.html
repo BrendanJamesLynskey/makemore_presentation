@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>makemore — Karpathy's Character-Level Language Model Explained</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/theme/black.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/monokai.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ==================== TITLE ==================== -->
+<section>
+    <h1 class="gradient-text">makemore</h1>
+    <p class="subtitle">Building an autoregressive character-level language model,<br>from bigram counts to WaveNet — Andrej Karpathy's <em>makemore</em></p>
+    <div class="meta-info">
+        <span>~32K names</span> · <span>27-character vocabulary</span> · <span>"makes more of things"</span>
+    </div>
+    <p class="nav-hint">Use <kbd>→</kbd> to advance · <kbd>↓</kbd> for sub-sections · <kbd>Esc</kbd> for overview</p>
+</section>
+
+<!-- ==================== ROADMAP ==================== -->
+<section>
+    <h2>Roadmap</h2>
+    <div class="roadmap" id="roadmap">
+        <div class="roadmap-item active" data-step="1">
+            <div class="roadmap-icon">📛</div>
+            <div class="roadmap-label">Problem &amp; Data</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="2">
+            <div class="roadmap-icon">🔢</div>
+            <div class="roadmap-label">Bigram Counts</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="3">
+            <div class="roadmap-icon">🧮</div>
+            <div class="roadmap-label">Bigram as a Net</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="4">
+            <div class="roadmap-icon">🧠</div>
+            <div class="roadmap-label">The MLP</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="5">
+            <div class="roadmap-icon">📊</div>
+            <div class="roadmap-label">Training Well</div>
+        </div>
+        <div class="roadmap-arrow">→</div>
+        <div class="roadmap-item" data-step="6">
+            <div class="roadmap-icon">🌊</div>
+            <div class="roadmap-label">WaveNet</div>
+        </div>
+    </div>
+</section>
+
+<!-- ==================== PART 1: THE PROBLEM & DATA ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 1</h2>
+    <h1 class="gradient-text">The Problem &amp; the Data</h1>
+    <p>From a list of names to a model that invents new ones</p>
+</section>
+
+<section>
+    <h3>names.txt — ~32K Names</h3>
+    <div class="two-col">
+        <div class="col">
+            <pre><code class="language-python"># One name per line
+words = open('names.txt', 'r').read().splitlines()
+
+len(words)        # 32033
+words[:8]
+# ['emma', 'olivia', 'ava', 'isabella',
+#  'sophia', 'charlotte', 'mia', 'amelia']
+
+min(len(w) for w in words)   # 2
+max(len(w) for w in words)   # 15</code></pre>
+            <div class="explain-box">
+                <p><strong>What:</strong> The 32,033 most common US baby names from 2018 (sourced from ssa.gov) — all lowercase, one per line.</p>
+                <p><strong>The goal:</strong> learn the statistical structure of these names so we can <em>make more</em> of them — plausible new names that were never in the list.</p>
+            </div>
+        </div>
+        <div class="col">
+            <div class="text-sample" id="names-sample">
+                <div class="text-sample-header">names.txt (first lines)</div>
+                <div class="text-sample-body">emma
+olivia
+ava
+isabella
+sophia
+charlotte
+mia
+amelia
+harper
+evelyn
+abigail
+...</div>
+            </div>
+            <div class="stat-row">
+                <div class="stat"><span class="stat-num">32,033</span><span class="stat-label">names</span></div>
+                <div class="stat"><span class="stat-num">27</span><span class="stat-label">vocab (a–z + .)</span></div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section>
+    <h3>A Character-Level Vocabulary</h3>
+    <pre><code class="language-python"># All the lowercase letters used in the names
+chars = sorted(list(set(''.join(words))))   # ['a', 'b', ..., 'z']
+
+# Map characters to integers, reserving 0 for the special token '.'
+stoi = {s:i+1 for i,s in enumerate(chars)}   # a→1, b→2, ..., z→26
+stoi['.'] = 0                                  # start / end token
+itos = {i:s for s,i in stoi.items()}          # integer → character
+
+vocab_size = len(itos)   # 27</code></pre>
+    <div class="explain-box">
+        <p><strong>The special <code>.</code> token (index 0)</strong> does double duty: it marks both the <em>start</em> and the <em>end</em> of a word. Wrapping each name as <code>.emma.</code> lets a single model learn which characters begin a name, which follow each other, and which end it.</p>
+    </div>
+    <div class="interactive-demo" id="vocab-demo">
+        <label>Try it — type a name fragment to see the integer encoding (with start/end <code>.</code>):</label>
+        <input type="text" id="vocab-input" value="emma" maxlength="15" spellcheck="false">
+        <div class="token-display" id="vocab-output"></div>
+    </div>
+</section>
+
+<section>
+    <h3>Framing the Task</h3>
+    <div class="formula">
+        P( name ) = &prod;<sub>t</sub> P( c<sub>t</sub> | <span class="accent">context</span> )
+    </div>
+    <div class="explain-box">
+        <p><strong>Autoregressive modelling:</strong> the probability of a whole name is the product of the probability of each character given what came before it. Predict one character at a time, feed it back in, and repeat.</p>
+        <p><strong>The simplest possible context</strong> is just the single previous character — that is the <em>bigram</em> model of Part 2. Later parts widen the context (an MLP over several previous characters, then a WaveNet-style hierarchy).</p>
+    </div>
+    <pre><code class="language-python"># Wrap every word with the start/end token, then walk character pairs
+for w in words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        ix1, ix2 = stoi[ch1], stoi[ch2]   # (previous char, next char)</code></pre>
+</section>
+</section>
+
+<!-- ==================== PART 2: THE BIGRAM MODEL ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 2</h2>
+    <h1 class="gradient-text">The Bigram Model</h1>
+    <p>Just count the pairs — no gradient descent required</p>
+</section>
+
+<section>
+    <h3>Counting Bigrams into a 27×27 Matrix</h3>
+    <pre><code class="language-python">import torch
+
+# N[i, j] = how many times character j follows character i
+N = torch.zeros((27, 27), dtype=torch.int32)
+
+for w in words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        ix1, ix2 = stoi[ch1], stoi[ch2]
+        N[ix1, ix2] += 1            # tally this pair</code></pre>
+    <div class="explain-box">
+        <p><strong>That is the entire "training".</strong> One pass over the data, incrementing counts. <code>N[0]</code> (row for <code>.</code>) counts which letters <em>start</em> names; the column for <code>.</code> counts which letters <em>end</em> them.</p>
+        <p>The matrix is small enough to look at directly — hover the heatmap below to read off real co-occurrence counts.</p>
+    </div>
+</section>
+
+<section>
+    <h3>The Count Matrix N (hover to inspect)</h3>
+    <div class="heatmap-wrap">
+        <div class="heatmap-grid" id="bigram-heatmap"></div>
+        <div class="heatmap-caption" id="heatmap-caption">Rows = previous character · Columns = next character · brighter = more frequent</div>
+    </div>
+    <div class="explain-box small">
+        <p>The bright cell at row <code>.</code>, column <code>a</code> reflects how many names start with "a"; the <code>n</code>→<code>.</code> cell reflects how many end in "n". (Counts here are illustrative, scaled to the real distribution.)</p>
+    </div>
+</section>
+
+<section>
+    <h3>Normalising Rows into Probabilities</h3>
+    <pre><code class="language-python"># Convert counts to a probability distribution per row.
+# Model smoothing: add 1 to every count so nothing is exactly zero.
+P = (N + 1).float()
+P /= P.sum(1, keepdim=True)      # each row now sums to 1.0</code></pre>
+    <div class="explain-box">
+        <p><strong>Row-normalisation:</strong> dividing each row by its total turns counts into <code>P(next | previous)</code>. The <code>keepdim=True</code> matters — it keeps the divisor shaped <code>(27, 1)</code> so it broadcasts correctly across columns.</p>
+        <p><strong>Smoothing (+1):</strong> adding one to every count guarantees no probability is exactly zero. Without it, an unseen bigram would give the model <em>infinite</em> loss when it later appears. More smoothing → a flatter, more uniform model.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Sampling &amp; Evaluating (NLL)</h3>
+    <div class="two-col">
+        <div class="col">
+            <pre><code class="language-python"># Sample a name, one character at a time
+g = torch.Generator().manual_seed(2147483647)
+ix = 0                       # start at '.'
+out = []
+while True:
+    p = P[ix]               # row = dist. over next char
+    ix = torch.multinomial(
+        p, num_samples=1,
+        replacement=True, generator=g).item()
+    if ix == 0: break       # hit the end token '.'
+    out.append(itos[ix])
+print(''.join(out))         # e.g. 'mor', 'axx', 'minaymoryles'</code></pre>
+        </div>
+        <div class="col">
+            <pre><code class="language-python"># Loss = average negative log-likelihood
+log_likelihood = 0.0
+n = 0
+for w in words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        prob = P[stoi[ch1], stoi[ch2]]
+        log_likelihood += torch.log(prob)
+        n += 1
+nll = -log_likelihood / n
+print(f'{nll=}')   # ~2.45</code></pre>
+        </div>
+    </div>
+    <div class="explain-box small">
+        <p><strong>torch.multinomial</strong> draws a character index in proportion to the row's probabilities. <strong>Negative log-likelihood</strong> is the loss: the average <code>-log P</code> assigned to the true next characters. Lower is better; a uniform model would score <code>log(27) ≈ 3.30</code>, so ~2.45 is a real improvement from just counting.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 3: BIGRAM AS A NEURAL NET ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 3</h2>
+    <h1 class="gradient-text">The Bigram as a Neural Net</h1>
+    <p>The same model, now trained by gradient descent</p>
+</section>
+
+<section>
+    <h3>One-Hot Inputs × a 27×27 Weight Matrix</h3>
+    <pre><code class="language-python">import torch.nn.functional as F
+
+# Build the training set of (input char, target char) pairs
+xs, ys = [], []
+for w in words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        xs.append(stoi[ch1]); ys.append(stoi[ch2])
+xs, ys = torch.tensor(xs), torch.tensor(ys)
+
+# A single 27x27 weight matrix — the only parameters
+g = torch.Generator().manual_seed(2147483647)
+W = torch.randn((27, 27), generator=g, requires_grad=True)</code></pre>
+    <div class="explain-box">
+        <p>Each input character is turned into a <strong>one-hot vector</strong> of length 27. Multiplying a one-hot by <code>W</code> just selects one row of <code>W</code> — so <code>W</code> plays exactly the role the count matrix did, but now its entries are learnable.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Logits → Softmax → Cross-Entropy</h3>
+    <pre><code class="language-python">xenc = F.one_hot(xs, num_classes=27).float()   # (N, 27)
+logits = xenc @ W                # (N, 27)  -- log-counts
+counts = logits.exp()            # exponentiate → positive "counts"
+probs  = counts / counts.sum(1, keepdim=True)   # softmax → P(next)
+
+# Negative log-likelihood of the correct next characters (+ regularisation)
+loss = -probs[torch.arange(len(xs)), ys].log().mean() + 0.01*(W**2).mean()</code></pre>
+    <div class="explain-box">
+        <p><strong>This is the "softmax" written out by hand:</strong> <code>exp</code> turns logits into positive numbers (interpretable as counts), then normalising gives probabilities. The loss is the same negative log-likelihood as Part 2.</p>
+        <p><strong>Equivalence:</strong> minimising this cross-entropy <em>is</em> the smoothed counting model. The <code>0.01*(W**2)</code> regularisation term acts just like the <code>+1</code> smoothing — pulling <code>W</code> toward zero gives a more uniform, smoother distribution.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Training W by Gradient Descent</h3>
+    <pre><code class="language-python">for k in range(100):
+    # forward pass
+    xenc = F.one_hot(xs, num_classes=27).float()
+    logits = xenc @ W
+    counts = logits.exp()
+    probs = counts / counts.sum(1, keepdim=True)
+    loss = -probs[torch.arange(len(xs)), ys].log().mean() + 0.01*(W**2).mean()
+
+    # backward pass
+    W.grad = None
+    loss.backward()             # autograd fills W.grad
+
+    # nudge the weights downhill
+    W.data += -50 * W.grad      # large LR because the problem is convex</code></pre>
+    <div class="explain-box small">
+        <p><strong>The punchline:</strong> gradient descent on this 729-parameter net converges to essentially the <em>same</em> loss (~2.45) as direct counting. The neural-net framing buys nothing here — but it is the template that <em>does</em> scale, because we can now swap in richer architectures and let autograd do the work. Everything that follows is this same loop with a bigger model.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 4: THE MLP (Bengio 2003) ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 4</h2>
+    <h1 class="gradient-text">The MLP — Bengio 2003</h1>
+    <p>A wider context and a learned embedding of characters</p>
+</section>
+
+<section>
+    <h3>Block Size &amp; the Embedding Table C</h3>
+    <pre><code class="language-python">block_size = 3        # how many previous chars to condition on
+
+# Build (context, next-char) examples, sliding the window per word
+X, Y = [], []
+for w in words:
+    context = [0] * block_size           # start: '...'
+    for ch in w + '.':
+        ix = stoi[ch]
+        X.append(context); Y.append(ix)
+        context = context[1:] + [ix]     # crop and append
+X, Y = torch.tensor(X), torch.tensor(Y)
+
+# Each of 27 chars → a learned 10-dim vector
+C = torch.randn((27, 10))               # the embedding table</code></pre>
+    <div class="explain-box">
+        <p>Instead of one previous character we now use <code>block_size</code> of them. Each character index looks up a row of <code>C</code> — a dense <strong>embedding</strong> — so similar characters can come to share similar vectors. This is the model from Bengio et al. (2003), the paper that launched neural language models.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Hidden tanh Layer → Output Logits</h3>
+    <pre><code class="language-python"># Parameters
+C  = torch.randn((27, 10))
+W1 = torch.randn((10 * block_size, 200)); b1 = torch.randn(200)
+W2 = torch.randn((200, 27));              b2 = torch.randn(27)
+parameters = [C, W1, b1, W2, b2]
+
+# Forward pass
+emb = C[X]                       # (N, block_size, 10)
+h = torch.tanh(emb.view(-1, 30) @ W1 + b1)   # (N, 200) hidden layer
+logits = h @ W2 + b2             # (N, 27)
+loss = F.cross_entropy(logits, Y)            # softmax + NLL in one call</code></pre>
+    <div class="explain-box">
+        <p><strong>Three stages:</strong> concatenate the <code>block_size</code> embeddings into one flat vector, pass through a hidden layer with a <code>tanh</code> non-linearity, then a final linear layer to 27 logits. <code>F.cross_entropy</code> fuses softmax + NLL — numerically safer and faster than doing it by hand.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Minibatching, LR Finding &amp; Splits</h3>
+    <div class="two-col">
+        <div class="col">
+            <pre><code class="language-python"># Minibatch: don't use all 200K+ rows each step
+for i in range(200000):
+    ix = torch.randint(0, X.shape[0], (32,))
+    emb = C[X[ix]]
+    h = torch.tanh(emb.view(-1, 30) @ W1 + b1)
+    logits = h @ W2 + b2
+    loss = F.cross_entropy(logits, Y[ix])
+    for p in parameters: p.grad = None
+    loss.backward()
+    lr = 0.1 if i < 100000 else 0.01   # decay
+    for p in parameters: p.data += -lr * p.grad</code></pre>
+        </div>
+        <div class="col">
+            <div class="explain-box">
+                <p><strong>Minibatches</strong> make each step ~1000× cheaper. The gradient is noisier, but "it is better to take many approximate steps than few exact ones."</p>
+                <p><strong>LR finding:</strong> sweep the learning rate across a range and watch the loss to locate a good value, then decay it late in training.</p>
+            </div>
+            <div class="formula" style="font-size:0.45em;">
+                train 80% · <span class="accent">dev 10%</span> · test 10%
+            </div>
+            <div class="explain-box small">
+                <p><strong>Three-way split:</strong> train the parameters on the training set, tune hyper-parameters (hidden size, embedding dim, LR) on the dev/validation set, and touch the test set only once, at the very end.</p>
+            </div>
+        </div>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 5: MAKING IT TRAIN WELL ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 5</h2>
+    <h1 class="gradient-text">Making It Train Well</h1>
+    <p>Initialisation, activations, gradients &amp; BatchNorm</p>
+</section>
+
+<section>
+    <h3>The "Hockey Stick" Loss</h3>
+    <div class="two-col">
+        <div class="col">
+            <pre><code class="language-python"># A confidently WRONG net at init has huge logits
+logits = h @ W2 + b2          # values like +13, -9, ...
+# softmax is then nearly one-hot on the wrong class
+# → loss starts at ~27 instead of ~3.3
+
+# Fix: shrink the output layer at init
+W2 = torch.randn((200, 27)) * 0.01
+b2 = torch.zeros(27)          # logits ≈ 0 → uniform-ish</code></pre>
+            <div class="explain-box small">
+                <p>Expected loss at init should be roughly <code>-log(1/27) ≈ 3.30</code> — a model that admits it knows nothing. Big random logits make it scream a wrong answer instead.</p>
+            </div>
+        </div>
+        <div class="col">
+            <pre><code class="language-python"># tanh saturation kills gradients
+h = torch.tanh(emb @ W1 + b1)
+# if pre-activations are large, h is all ±1
+# tanh'(±1) ≈ 0  → no gradient flows back
+
+# Fix: scale W1 so pre-activations stay small
+# kaiming-ish init keeps each layer's
+# activation std ≈ 1
+W1 = torch.randn((30, 200)) * (5/3) / 30**0.5</code></pre>
+            <div class="explain-box small">
+                <p>A histogram of <code>h</code> packed at ±1 means dead neurons. Proper scaling keeps activations in <code>tanh</code>'s linear region so gradients survive.</p>
+            </div>
+        </div>
+    </div>
+    <div class="explain-box">
+        <p><strong>The "hockey stick":</strong> a badly-initialised net wastes its first hundreds of steps just squashing absurd initial logits down to sane values, producing a sharp early drop then a plateau. Good init removes that wasted phase — the loss starts low and the whole curve improves.</p>
+    </div>
+</section>
+
+<section>
+    <h3>Kaiming-ish Scaling</h3>
+    <div class="formula">
+        std(W) = <span class="accent">gain</span> / &radic;<span style="font-size:0.85em;">fan_in</span> &nbsp;&nbsp;(gain = 5/3 for tanh)
+    </div>
+    <pre><code class="language-python"># PyTorch's built-in does the same thing
+torch.nn.init.kaiming_normal_(W1, mode='fan_in', nonlinearity='tanh')</code></pre>
+    <div class="explain-box">
+        <p><strong>Why divide by &radic;fan_in?</strong> Summing <code>fan_in</code> independent products inflates the variance of the pre-activation by a factor of <code>fan_in</code>. Dividing the weights' std by <code>&radic;fan_in</code> exactly cancels it, so activations keep unit variance layer after layer instead of exploding or vanishing.</p>
+        <p>The <strong>gain</strong> corrects for the squashing each non-linearity applies — <code>5/3</code> for <code>tanh</code>, <code>&radic;2</code> for ReLU.</p>
+    </div>
+</section>
+
+<section>
+    <h3>BatchNorm — Normalise the Pre-Activations</h3>
+    <pre><code class="language-python"># Standardise the hidden pre-activations across the batch,
+# then let the net learn its own scale (gain) and shift (bias)
+hpreact = embcat @ W1 + b1
+hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) \
+                 / hpreact.std(0, keepdim=True)  + bnbias
+h = torch.tanh(hpreact)</code></pre>
+    <div class="explain-box">
+        <p><strong>Why it helps:</strong> by forcing each batch's pre-activations to be roughly unit-Gaussian, BatchNorm makes the network far less sensitive to exactly how the weights were initialised — the "hockey stick" tuning above becomes much less fiddly. It also adds a mild regularising noise, since each example's normalisation depends on the rest of its batch.</p>
+    </div>
+</section>
+
+<section>
+    <h3>BatchNorm — Train vs Eval Running Stats</h3>
+    <pre><code class="language-python"># Buffers updated during training (NOT trained by backprop)
+bnmean_running = torch.zeros((1, 200))
+bnstd_running  = torch.ones((1, 200))
+
+with torch.no_grad():                       # exponential moving average
+    bnmean_running = 0.999*bnmean_running + 0.001*hpreact.mean(0, keepdim=True)
+    bnstd_running  = 0.999*bnstd_running  + 0.001*hpreact.std(0, keepdim=True)
+
+# At eval / sampling time there may be no batch — use the running stats
+hpreact = bngain * (hpreact - bnmean_running) / bnstd_running + bnbias</code></pre>
+    <div class="explain-box small">
+        <p><strong>The catch with BatchNorm:</strong> at training time each example is normalised using its batch's statistics, which is fine. But to score or sample a <em>single</em> name there is no batch. The fix is to keep an exponential moving average of the mean and std during training and use those fixed "running" stats at eval time — the train/eval behaviour now differs, a subtlety you must get right.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== PART 6: WAVENET ==================== -->
+<section>
+<section>
+    <h2 class="section-title">Part 6</h2>
+    <h1 class="gradient-text">Going Deeper: WaveNet</h1>
+    <p>Fuse the context hierarchically, not all at once</p>
+</section>
+
+<section>
+    <h3>Flat Concat vs Hierarchical Fusion</h3>
+    <div class="multihead-visual">
+        <svg viewBox="0 0 700 230" class="diagram">
+            <text x="175" y="20" class="diagram-title">MLP: one big squash</text>
+            <rect x="40"  y="40" width="40" height="28" rx="4" class="tree-box"/><text x="60"  y="59" class="tree-text">c1</text>
+            <rect x="95"  y="40" width="40" height="28" rx="4" class="tree-box"/><text x="115" y="59" class="tree-text">c2</text>
+            <rect x="150" y="40" width="40" height="28" rx="4" class="tree-box"/><text x="170" y="59" class="tree-text">c3</text>
+            <rect x="205" y="40" width="40" height="28" rx="4" class="tree-box"/><text x="225" y="59" class="tree-text">c4</text>
+            <rect x="80"  y="150" width="120" height="34" rx="6" class="tree-box out"/><text x="140" y="171" class="tree-text">Linear → h</text>
+            <line x1="60"  y1="68" x2="140" y2="150" class="flow-line"/>
+            <line x1="115" y1="68" x2="140" y2="150" class="flow-line"/>
+            <line x1="170" y1="68" x2="140" y2="150" class="flow-line"/>
+            <line x1="225" y1="68" x2="140" y2="150" class="flow-line"/>
+
+            <text x="525" y="20" class="diagram-title">WaveNet: fuse in pairs</text>
+            <rect x="390" y="40" width="40" height="28" rx="4" class="tree-box"/><text x="410" y="59" class="tree-text">c1</text>
+            <rect x="445" y="40" width="40" height="28" rx="4" class="tree-box"/><text x="465" y="59" class="tree-text">c2</text>
+            <rect x="500" y="40" width="40" height="28" rx="4" class="tree-box"/><text x="520" y="59" class="tree-text">c3</text>
+            <rect x="555" y="40" width="40" height="28" rx="4" class="tree-box"/><text x="575" y="59" class="tree-text">c4</text>
+            <rect x="405" y="105" width="65" height="28" rx="5" class="tree-box fuse"/><text x="437" y="123" class="tree-text">fuse</text>
+            <rect x="515" y="105" width="65" height="28" rx="5" class="tree-box fuse"/><text x="547" y="123" class="tree-text">fuse</text>
+            <rect x="455" y="160" width="75" height="30" rx="6" class="tree-box out"/><text x="492" y="179" class="tree-text">fuse → h</text>
+            <line x1="410" y1="68" x2="437" y2="105" class="flow-line"/>
+            <line x1="465" y1="68" x2="437" y2="105" class="flow-line"/>
+            <line x1="520" y1="68" x2="547" y2="105" class="flow-line"/>
+            <line x1="575" y1="68" x2="547" y2="105" class="flow-line"/>
+            <line x1="437" y1="133" x2="492" y2="160" class="flow-line"/>
+            <line x1="547" y1="133" x2="492" y2="160" class="flow-line"/>
+        </svg>
+    </div>
+    <div class="explain-box small">
+        <p><strong>The idea (DeepMind's WaveNet, 2016):</strong> rather than crushing the whole context into the hidden layer in one step, fuse two characters at a time, then fuse those results, and so on — a tree. Each layer combines a little more context, giving the network a deeper, more expressive view of longer sequences.</p>
+    </div>
+</section>
+
+<section>
+    <h3>FlattenConsecutive — the Key Operation</h3>
+    <pre><code class="language-python">class FlattenConsecutive:
+    """ Group every `n` consecutive elements along time into the channel dim. """
+    def __init__(self, n):
+        self.n = n
+    def __call__(self, x):
+        B, T, C = x.shape
+        x = x.view(B, T // self.n, C * self.n)   # fuse n neighbours
+        if x.shape[1] == 1:
+            x = x.squeeze(1)                      # drop a spurious dim
+        self.out = x
+        return self.out
+    def parameters(self):
+        return []</code></pre>
+    <div class="explain-box">
+        <p><strong>This replaces the single big flatten.</strong> Where the MLP did <code>emb.view(-1, block_size*n_embd)</code> once, <code>FlattenConsecutive(2)</code> merges only neighbouring pairs, halving the time dimension each layer. Stacking several of them builds the hierarchical tree above.</p>
+    </div>
+</section>
+
+<section>
+    <h3>A torch.nn-like API, Built by Hand</h3>
+    <pre><code class="language-python">class Linear:
+    def __init__(self, fan_in, fan_out, bias=True):
+        self.weight = torch.randn((fan_in, fan_out)) / fan_in**0.5  # kaiming
+        self.bias = torch.zeros(fan_out) if bias else None
+    def __call__(self, x):
+        self.out = x @ self.weight
+        if self.bias is not None: self.out += self.bias
+        return self.out
+    def parameters(self):
+        return [self.weight] + ([] if self.bias is None else [self.bias])
+
+# The model is just a Sequential stack of these hand-made modules
+model = Sequential([
+    Embedding(vocab_size, n_embd),
+    FlattenConsecutive(2), Linear(n_embd*2, n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+    FlattenConsecutive(2), Linear(n_hidden*2, n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+    FlattenConsecutive(2), Linear(n_hidden*2, n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+    Linear(n_hidden, vocab_size),
+])</code></pre>
+    <div class="explain-box small">
+        <p>Re-implementing <code>Linear</code>, <code>BatchNorm1d</code>, <code>Tanh</code>, <code>Embedding</code> and <code>Sequential</code> from scratch demystifies <code>torch.nn</code> — each is a tiny class with a <code>__call__</code> and a <code>parameters()</code> method. The training loop stays identical to Part 4. This is exactly how PyTorch's own modules are structured.</p>
+    </div>
+</section>
+</section>
+
+<!-- ==================== SUMMARY ==================== -->
+<section>
+<section>
+    <h2 class="gradient-text">The Progression at a Glance</h2>
+    <div class="summary-grid">
+        <div class="summary-card">
+            <h4>Bigram (counts)</h4>
+            <ul>
+                <li>27×27 count matrix N</li>
+                <li>Row-normalise → P</li>
+                <li>+1 smoothing</li>
+                <li>NLL ≈ 2.45</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Bigram (net)</h4>
+            <ul>
+                <li>One-hot @ W (27×27)</li>
+                <li>softmax = exp / sum</li>
+                <li>Cross-entropy = NLL</li>
+                <li>Recovers the counts</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>MLP (Bengio 2003)</h4>
+            <ul>
+                <li>Embedding table C</li>
+                <li>block_size context</li>
+                <li>tanh hidden layer</li>
+                <li>Minibatch + LR decay</li>
+            </ul>
+        </div>
+        <div class="summary-card">
+            <h4>Train well + WaveNet</h4>
+            <ul>
+                <li>Kaiming-ish init</li>
+                <li>BatchNorm (running stats)</li>
+                <li>FlattenConsecutive</li>
+                <li>Hand-built nn API</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<section>
+    <h2>Try It: Sample a Name</h2>
+    <div class="sampler-demo" id="sampler-demo">
+        <p style="font-size:0.5em; color:var(--text-muted);">Sampling character-by-character from a bigram probability table — exactly like <code>torch.multinomial</code> in Part 2.</p>
+        <div class="sampler-output" id="sampler-output"><span class="dot">.</span><span class="cursor">▌</span></div>
+        <button class="demo-btn" onclick="sampleName()">Generate a name ▶</button>
+        <button class="demo-btn" onclick="sampleBatch()">Generate 8 ▶</button>
+        <div class="nll-readout" id="sampler-nll"></div>
+        <div class="sampler-names" id="sampler-names"></div>
+    </div>
+    <div class="explain-box small">
+        <p>Each step reads the current character's row of probabilities, draws the next character in proportion to them, and stops when it samples the end token <code>.</code> — the whole of Part 2's generation loop, running live in the browser.</p>
+    </div>
+</section>
+
+<section>
+    <h2>Where This Fits in Zero-to-Hero</h2>
+    <div class="comparison-table">
+        <table>
+            <thead>
+                <tr><th>Video</th><th>Model</th><th>What it adds</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>makemore 1</td><td>Bigram → net</td><td>Counts, NLL, the neural-net framing &amp; gradient descent</td></tr>
+                <tr><td>makemore 2</td><td>MLP</td><td>Embeddings, wider context, minibatching, train/dev/test</td></tr>
+                <tr><td>makemore 3</td><td>MLP + BatchNorm</td><td>Init, activations, gradients, BatchNorm diagnostics</td></tr>
+                <tr><td>makemore 4</td><td>"becoming a backprop ninja"</td><td>Backprop through the MLP by hand</td></tr>
+                <tr><td>makemore 5</td><td>WaveNet</td><td>Hierarchical fusion, a hand-built torch.nn API</td></tr>
+                <tr><td>nanoGPT</td><td>Transformer</td><td>Self-attention replaces the fixed context window</td></tr>
+            </tbody>
+        </table>
+        <p class="table-note">makemore is the spine of the early "Neural Networks: Zero to Hero" lectures — each builds directly on the last, leading naturally into the GPT/Transformer material.</p>
+    </div>
+</section>
+
+<section>
+    <h2>Key Takeaways</h2>
+    <div class="takeaways">
+        <div class="takeaway">
+            <span class="takeaway-num">1</span>
+            <p><strong>Counting and a neural net agree.</strong> A bigram count matrix and a one-layer net trained by gradient descent reach the same loss — the net is just a more general, scalable way of writing the same idea.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">2</span>
+            <p><strong>Context is capacity.</strong> Widening from one previous character (bigram) to several (MLP) and then fusing them hierarchically (WaveNet) steadily lowers the loss and yields more name-like samples.</p>
+        </div>
+        <div class="takeaway">
+            <span class="takeaway-num">3</span>
+            <p><strong>Getting training right matters as much as the architecture.</strong> Initialisation, activation statistics, and BatchNorm decide whether a net learns at all — the unglamorous details are the difference.</p>
+        </div>
+    </div>
+    <div class="credits">
+        <p>Based on Andrej Karpathy's <a href="https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ" target="_blank">"Neural Networks: Zero to Hero"</a> playlist</p>
+        <p>Code: <a href="https://github.com/karpathy/makemore" target="_blank">github.com/karpathy/makemore</a></p>
+    </div>
+</section>
+</section>
+
+</div><!-- /slides -->
+</div><!-- /reveal -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/plugin/highlight/highlight.min.js"></script>
+<script src="interactive.js"></script>
+<script>
+Reveal.initialize({
+    hash: true,
+    slideNumber: true,
+    transition: 'slide',
+    backgroundTransition: 'fade',
+    plugins: [ RevealHighlight ],
+    width: 1200,
+    height: 700,
+    margin: 0.04,
+});
+</script>
+</body>
+</html>
